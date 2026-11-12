@@ -11,7 +11,11 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 5173);
 let MODEL = process.env.GEMINI_MODEL || ""; // chosen from the key's available models when empty
 let API_KEY = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "").trim();
-let ai = new GoogleGenAI({ apiKey: API_KEY || "missing" });
+// Fail fast: the SDK's default is 5 attempts with up to a minute between them, which leaves a
+// learner waiting for minutes when Gemini is overloaded. We fall back to other models instead.
+const makeClient = (apiKey) => new GoogleGenAI({ apiKey, httpOptions: { timeout: 20000, retryOptions: { attempts: 1 } } });
+let ai = makeClient(API_KEY || "missing");
+let CANDIDATES = []; // models this key can use, best first
 // On a public host (Render sets RENDER), visitors can't change the key and usage is limited per visitor.
 const HOSTED = Boolean(process.env.RENDER || process.env.HOSTED);
 const LIMIT_PER_HOUR = Number(process.env.LIMIT_PER_HOUR || 60);
@@ -78,16 +82,17 @@ async function checkKey(key) {
   const version = (n) => Number((n.match(/^gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
   const byNewest = (a, b) => version(b) - version(a);
   const stableFlash = names.filter((n) => /^gemini-\d+(\.\d+)?-flash$/.test(n)).sort(byNewest);
+  const liteFlash = names.filter((n) => /^gemini-\d+(\.\d+)?-flash-lite$/.test(n)).sort(byNewest);
   const otherFlash = names.filter((n) => /^gemini-.*flash/.test(n) && !/image|tts|audio|live|lite|exp|preview/.test(n) && !stableFlash.includes(n)).sort(byNewest);
   const others = names.filter((n) => /^gemini-/.test(n) && !/image|tts|audio|live|embedding|exp/.test(n)).sort(byNewest);
-  const candidates = [...new Set([...(MODEL && names.includes(MODEL) ? [MODEL] : []), ...stableFlash, ...otherFlash, ...others])];
+  const candidates = [...new Set([...(MODEL && names.includes(MODEL) ? [MODEL] : []), ...stableFlash, ...liteFlash, ...otherFlash, ...others])];
   if (!candidates.length) throw new Error("This key works but can't use any Gemini text models. Create a new key at aistudio.google.com/apikey.");
   return candidates;
 }
 
 // Try models in order until one answers. Google lists some retired models that new keys can't use (404).
 async function pickWorkingModel(key, candidates) {
-  const test = new GoogleGenAI({ apiKey: key });
+  const test = makeClient(key);
   let lastErr;
   let busyModel = null; // the key works but this model was overloaded: usable later
   for (const model of candidates.slice(0, 8)) {
@@ -118,7 +123,9 @@ async function pickWorkingModel(key, candidates) {
 async function setKey(key) {
   key = String(key || "").trim().replace(/^["']|["']$/g, "");
   if (!key) throw new Error("Paste your Gemini API key first.");
-  const { model, client: test } = await pickWorkingModel(key, await checkKey(key));
+  const candidates = await checkKey(key);
+  const { model, client: test } = await pickWorkingModel(key, candidates);
+  CANDIDATES = candidates;
   API_KEY = key;
   MODEL = model;
   ai = test;
@@ -240,17 +247,46 @@ async function ensureModel() {
   await settingUp;
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function generate(params) {
-  for (let attempt = 0; ; attempt++) {
+const isBusy = (err) =>
+  (err instanceof ApiError && [429, 500, 503, 504].includes(err.status)) ||
+  (!(err instanceof ApiError) && /time|abort/i.test(`${err?.name} ${err?.message}`));
+
+// Keep live turns fast: think as little as the model allows, unless we want a deeper answer.
+function thinkingFor(model, deeper) {
+  if (deeper) return undefined;
+  if (/^gemini-2\.5-flash/.test(model)) return { thinkingBudget: 0 };
+  const major = Number((model.match(/^gemini-(\d+)/) || [])[1] || 0);
+  return major >= 3 ? { thinkingLevel: "LOW" } : undefined;
+}
+
+// Try the current model, and if Google says it's overloaded, move on to the next one that answers.
+async function generate(contents, baseConfig, deeper) {
+  const order = [MODEL, ...CANDIDATES.filter((m) => m !== MODEL)].slice(0, 5);
+  let lastErr;
+  for (const model of order) {
+    const config = { ...baseConfig };
+    const thinking = thinkingFor(model, deeper);
+    if (thinking) config.thinkingConfig = thinking;
     try {
-      return await ai.models.generateContent(params);
+      let response;
+      try {
+        response = await ai.models.generateContent({ model, contents, config });
+      } catch (err) {
+        // If this model doesn't accept the thinking setting, retry once without it.
+        if (!(err instanceof ApiError) || err.status !== 400 || !config.thinkingConfig || !/think/i.test(err.message)) throw err;
+        delete config.thinkingConfig;
+        response = await ai.models.generateContent({ model, contents, config });
+      }
+      if (model !== MODEL) { console.log(`Switched to ${model} because ${MODEL} was busy`); MODEL = model; }
+      return response;
     } catch (err) {
-      // Google's "high demand" errors are usually gone within seconds.
-      if (attempt < 2 && err instanceof ApiError && [500, 503].includes(err.status)) { await sleep(1500 * (attempt + 1)); continue; }
-      throw err;
+      lastErr = err;
+      const gone = err instanceof ApiError && err.status === 404;
+      if (!isBusy(err) && !gone) throw err;
+      console.log(`${model} ${gone ? "isn't available" : "is busy"} (${err.status || err.name}), trying the next model`);
     }
   }
+  throw lastErr;
 }
 
 async function ask(schema, system, messages, deeper = false) {
@@ -267,22 +303,7 @@ async function ask(schema, system, messages, deeper = false) {
     responseMimeType: "application/json",
     responseJsonSchema: toGeminiSchema(schema),
   };
-  // Keep live turns fast on Flash: skip thinking unless we want a deeper answer.
-  // Keep live turns fast: think as little as the model allows, unless we want a deeper answer.
-  if (!deeper) {
-    if (/^gemini-2\.5-flash/.test(MODEL)) config.thinkingConfig = { thinkingBudget: 0 };
-    else if (/^gemini-(\d+)/.test(MODEL) && Number(MODEL.match(/^gemini-(\d+)/)[1]) >= 3) config.thinkingConfig = { thinkingLevel: "LOW" };
-  }
-
-  let response;
-  try {
-    response = await generate({ model: MODEL, contents, config });
-  } catch (err) {
-    // If this model doesn't accept the thinking setting, retry once without it.
-    if (!(err instanceof ApiError) || err.status !== 400 || !config.thinkingConfig || !/think/i.test(err.message)) throw err;
-    delete config.thinkingConfig;
-    response = await generate({ model: MODEL, contents, config });
-  }
+  const response = await generate(contents, config, deeper);
   const text = response.text;
   if (!text) throw new Error("The coach could not answer that. Try rephrasing.");
   try {
@@ -394,7 +415,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOSTED ? "0.0.0.0" : "127.0.0.1", () => {
   console.log(`English coach running at http://localhost:${PORT}`);
   if (API_KEY && !MODEL) {
-    setKey(API_KEY).then(() => console.log(`Model: ${MODEL}`)).catch((e) => console.error("Saved key problem:", e.message));
+    ensureModel().then(() => console.log(`Model: ${MODEL}`)).catch((e) => console.error("Saved key problem:", e.message));
   } else console.log(`Model: ${MODEL || "chosen when you add a key"}`);
   if (!API_KEY) console.warn("No Gemini key yet: paste it in the page, or put GEMINI_API_KEY=... in .env");
 });
