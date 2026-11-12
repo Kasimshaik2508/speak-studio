@@ -384,7 +384,8 @@ const handlers = {
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" };
 
 function send(res, status, body, type = "application/json") {
-  res.writeHead(status, { "Content-Type": type });
+  // no-cache: browsers check for a newer version each time, so updates reach everyone straight away.
+  res.writeHead(status, { "Content-Type": type, "Cache-Control": "no-cache" });
   res.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
 }
 
@@ -393,10 +394,10 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/api/status") {
     if (API_KEY && !MODEL) ensureModel().catch((e) => console.error("Model setup:", e.message));
-    return send(res, 200, { hasKey: Boolean(API_KEY && MODEL), model: MODEL, locked: HOSTED });
+    return send(res, 200, { hasKey: Boolean(API_KEY && (MODEL || HOSTED)), model: MODEL, locked: HOSTED });
   }
   if (req.method === "POST" && url.pathname === "/api/key") {
-    if (HOSTED) return send(res, 403, { error: "The key can't be changed on the shared site." });
+    if (HOSTED) return send(res, 403, { error: "You don't need a key here: this shared site already uses its owner's Gemini key. Just start practising!" });
     try {
       const body = await readBody(req);
       return send(res, 200, await setKey(JSON.parse(body || "{}").key));

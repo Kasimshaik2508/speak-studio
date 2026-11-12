@@ -802,7 +802,10 @@ $("closeReport").onclick = () => ($("report").hidden = true);
 
 // ================= API key =================
 let serverHasKey = false;
-let keyLocked = false; // the shared, hosted site never asks visitors for a key
+// The shared, hosted site never asks visitors for a key: the owner sets it on the host.
+// Only a copy running on this computer (localhost) lets you paste one.
+let keyLocked = !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+if (keyLocked) $("changeKey").hidden = true;
 function showKeyBox(canCancel = false) {
   if (keyLocked) return;
   $("keyBox").hidden = false;
@@ -836,13 +839,25 @@ $("keyBox").onsubmit = async (e) => {
     $("keySave").disabled = false;
   }
 };
-fetch("/api/status").then((r) => r.json()).then((d) => {
-  keyLocked = Boolean(d.locked);
-  if (keyLocked) { $("changeKey").hidden = true; $("keyBox").hidden = true; $("keyState").textContent = d.hasKey ? "connected" : "not set up yet"; serverHasKey = d.hasKey; }
-  else setKeyState(d.hasKey, d.model);
-}).catch(() => {
-  $("keyState").textContent = "server not running";
-});
+// The free host sleeps when idle, so the first check can fail while it wakes up: keep trying.
+async function checkStatus(attempt = 0) {
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    if (!r.ok) throw new Error(String(r.status));
+    const d = await r.json();
+    keyLocked = keyLocked || Boolean(d.locked);
+    if (keyLocked) {
+      $("changeKey").hidden = true;
+      $("keyBox").hidden = true;
+      serverHasKey = d.hasKey;
+      $("keyState").textContent = d.hasKey ? "connected" : "not set up yet";
+    } else setKeyState(d.hasKey, d.model);
+  } catch {
+    $("keyState").textContent = attempt < 20 ? "waking up the server…" : "server not reachable";
+    if (attempt < 20) setTimeout(() => checkStatus(attempt + 1), 5000);
+  }
+}
+checkStatus();
 
 // ================= starter passages =================
 // So "Start reading" works right away, before any passage has been generated.
