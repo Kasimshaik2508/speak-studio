@@ -87,6 +87,7 @@ output { font-family: var(--font-mono); color: var(--ink); }
 /* ---------- Stage ---------- */
 .stage { padding: 24px max(16px, 3vw) 40px; display: flex; flex-direction: column; gap: 18px; max-width: 920px; width: 100%; min-width: 0; }
 .support-warning { background: var(--warn-soft); color: var(--warn); padding: 10px 14px; border-radius: var(--radius); font-size: 14px; }
+.support-warning.info { background: var(--accent-soft); color: var(--ink); }
 .keybox { grid-column: 1 / -1; margin: 16px max(16px, 3vw) 0; background: var(--accent-soft); border: 1px solid var(--accent); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
 .keybox-text { display: flex; flex-direction: column; gap: 2px; }
 .keybox a { color: var(--accent); font-weight: 600; }

@@ -170,21 +170,42 @@ function setCoachSpeaking(on) {
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 // Live microphone level, so the learner can see whether any sound reaches the browser.
+// With record: true it also keeps the audio, for Gemini to turn into text.
+const LOUD = 0.06; // level that counts as speaking
 const micMeter = {
-  stream: null, ctx: null, raf: 0, peak: 0,
-  async start() {
-    this.peak = 0;
+  stream: null, ctx: null, raf: 0, peak: 0, chunks: [], firstLoud: 0, lastLoud: 0,
+  async start({ record = false } = {}) {
+    this.peak = 0; this.chunks = []; this.firstLoud = 0; this.lastLoud = 0;
+    if (!navigator.mediaDevices?.getUserMedia) { if (record) throw new Error("This browser can't use the microphone. Open the page in Chrome, Edge or Brave."); return; }
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     } catch (err) {
       if (err.name === "NotAllowedError") throw new Error(MIC_BLOCKED);
       if (err.name === "NotFoundError") throw new Error("No microphone was found. Plug one in or pick one in your computer's sound settings, then try again.");
+      if (record) throw new Error("Couldn't open the microphone: " + err.message);
       return; // the meter is only a helper; recognition may still work
     }
     this.ctx = new AudioContext();
+    if (this.ctx.state === "suspended") await this.ctx.resume().catch(() => {});
+    const src = this.ctx.createMediaStreamSource(this.stream);
     const an = this.ctx.createAnalyser();
     an.fftSize = 1024;
-    this.ctx.createMediaStreamSource(this.stream).connect(an);
+    src.connect(an);
+    if (record) {
+      const proc = this.ctx.createScriptProcessor(4096, 1, 1);
+      const mute = this.ctx.createGain();
+      mute.gain.value = 0;
+      src.connect(proc); proc.connect(mute); mute.connect(this.ctx.destination);
+      proc.onaudioprocess = (e) => {
+        const d = new Float32Array(e.inputBuffer.getChannelData(0));
+        let m = 0;
+        for (const v of d) m = Math.max(m, Math.abs(v));
+        const loud = m > LOUD;
+        this.peak = Math.max(this.peak, m);
+        if (loud) { const now = Date.now(); this.firstLoud ||= now; this.lastLoud = now; }
+        this.chunks.push({ d, loud });
+      };
+    }
     const buf = new Uint8Array(an.fftSize);
     const tick = () => {
       an.getByteTimeDomainData(buf);
@@ -197,11 +218,42 @@ const micMeter = {
     };
     tick();
   },
+  // The recording as a 16 kHz mono WAV in base64, trimmed of silence at both ends.
+  takeWav() {
+    const rate = this.ctx.sampleRate;
+    let first = this.chunks.findIndex((c) => c.loud);
+    let last = this.chunks.findLastIndex((c) => c.loud);
+    if (first < 0) return "";
+    const pad = Math.ceil((0.4 * rate) / 4096);
+    const parts = this.chunks.slice(Math.max(0, first - pad), last + pad + 1).map((c) => c.d);
+    const total = parts.reduce((a, c) => a + c.length, 0);
+    const all = new Float32Array(total);
+    let o = 0;
+    for (const c of parts) { all.set(c, o); o += c.length; }
+    const target = 16000, ratio = rate / target, n = Math.floor(total / ratio);
+    const bytes = new Uint8Array(44 + n * 2);
+    const dv = new DataView(bytes.buffer);
+    const str = (off, t) => [...t].forEach((ch, i) => dv.setUint8(off + i, ch.charCodeAt(0)));
+    str(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); str(8, "WAVE"); str(12, "fmt ");
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, target, true); dv.setUint32(28, target * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    str(36, "data"); dv.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {
+      const a = Math.floor(i * ratio), b = Math.max(a + 1, Math.min(total, Math.floor((i + 1) * ratio)));
+      let sum = 0;
+      for (let k = a; k < b; k++) sum += all[k];
+      dv.setInt16(44 + i * 2, Math.max(-1, Math.min(1, sum / (b - a))) * 0x7fff, true);
+    }
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  },
   stop() {
     cancelAnimationFrame(this.raf);
     this.stream?.getTracks().forEach((t) => t.stop());
     this.ctx?.close().catch(() => {});
     this.stream = this.ctx = null;
+    this.chunks = [];
     document.querySelectorAll(".mic-level i").forEach((i) => (i.style.width = "0"));
   },
 };
@@ -217,7 +269,8 @@ function whyNoWords(lastError) {
 }
 const SPEECH_NETWORK = "Speech recognition couldn't connect to its service. It works in Google Chrome or Microsoft Edge with an internet connection; Brave, Arc, Opera, Firefox and in-app browsers don't support it.";
 
-const listener = {
+// Listening with the browser's own speech recognition (Chrome, Edge, Safari): words appear as you speak.
+const browserListener = {
   active: false,
   rec: null,
   // Resolves with { text, seconds } when listening stops.
@@ -243,11 +296,11 @@ const listener = {
         const end = lastSpeech || Date.now();
         resolve({ text, seconds: startedAt ? Math.max(1, (end - startedAt) / 1000) : 0 });
       };
-      const fail = (msg) => {
+      const fail = (msg, code = "") => {
         this.active = false;
         cleanup();
         try { this.rec?.abort(); } catch {}
-        reject(new Error(msg));
+        reject(Object.assign(new Error(msg), { code }));
       };
       hintTimer = setTimeout(() => { if (!startedAt && this.active) onHint?.(whyNoWords(lastError)); }, 6000);
       if (maxMs) maxTimer = setTimeout(() => this.stop(), maxMs);
@@ -274,7 +327,7 @@ const listener = {
               ? "Safari blocked speech recognition. Turn on Siri in System Settings, or use Google Chrome."
               : MIC_BLOCKED);
           else if (e.error === "audio-capture") fail("No microphone was found. Plug one in and try again.");
-          else if (e.error === "network") fail(SPEECH_NETWORK);
+          else if (e.error === "network") fail(SPEECH_NETWORK, "network");
           else if (e.error === "language-not-supported") fail(`This browser can't recognise ${$("lang").selectedOptions[0]?.textContent || "this language"}. Use Google Chrome.`);
           // "no-speech" and "aborted" are normal; onend handles them.
         };
@@ -301,6 +354,80 @@ const listener = {
     try { this.rec?.stop(); } catch {}
   },
 };
+
+// Listening by recording the voice and letting Gemini turn it into text. Used where the browser
+// has no working speech recognition (Brave, Firefox, ...). Words appear after you finish speaking.
+const cloudListener = {
+  active: false,
+  done: null,
+  async start({ onUpdate, onHint, autoStopMs = 0, maxMs = 120000 } = {}) {
+    tts.stop();
+    this.active = true;
+    try { await micMeter.start({ record: true }); } catch (err) { this.active = false; micMeter.stop(); throw err; }
+    if (!this.active) { micMeter.stop(); return { text: "", seconds: 0 }; }
+    const t0 = Date.now();
+    let hinted = false;
+    await new Promise((resolve) => {
+      const iv = setInterval(() => {
+        const now = Date.now();
+        if (!micMeter.firstLoud && !hinted && now - t0 > 6000) { hinted = true; onHint?.(whyNoWords("")); }
+        // Hands-free: stop after a pause once they've started speaking.
+        if (autoStopMs && micMeter.firstLoud && now - micMeter.lastLoud > autoStopMs) this.stop();
+        if (now - t0 > maxMs) this.stop();
+      }, 150);
+      this.done = () => { clearInterval(iv); resolve(); };
+    });
+    const { firstLoud, lastLoud } = micMeter;
+    const audio = firstLoud ? micMeter.takeWav() : "";
+    micMeter.stop();
+    if (!audio) return { text: "", seconds: 0 };
+    onHint?.("Turning your speech into text…");
+    const { text } = await api("transcribe", { audio, mimeType: "audio/wav" });
+    const clean = (text || "").trim();
+    if (clean) onUpdate?.(clean);
+    return { text: clean, seconds: Math.max(1, (lastLoud - firstLoud) / 1000) };
+  },
+  stop() {
+    if (!this.active) return;
+    this.active = false;
+    this.done?.();
+  },
+};
+
+const isBrave = Boolean(navigator.brave);
+const inAppBrowser = /Electron|Claude\//.test(navigator.userAgent);
+let cloudMode = !SR || isBrave || store.get("cloudListen", false);
+
+const listener = {
+  get active() { return browserListener.active || cloudListener.active; },
+  async start(opts = {}) {
+    if (cloudMode) return cloudListener.start(opts);
+    try {
+      return await browserListener.start(opts);
+    } catch (err) {
+      if (err.code !== "network") throw err;
+      // The browser's speech service is unreachable: switch to Gemini listening from now on.
+      cloudMode = true;
+      store.set("cloudListen", true);
+      showListenNote();
+      opts.onHint?.("Your browser's speech service isn't working, so Gemini is listening instead. Speak now…");
+      return cloudListener.start(opts);
+    }
+  },
+  stop() { browserListener.stop(); cloudListener.stop(); },
+};
+
+function showListenNote() {
+  const w = $("supportWarning");
+  if (inAppBrowser) {
+    w.textContent = "This in-app browser can't use the microphone. Open this page in Chrome, Edge or Brave to speak. You can still type your answers.";
+    w.hidden = false;
+  } else if (cloudMode) {
+    w.textContent = "Gemini is listening for you in this browser: your words appear just after you finish speaking.";
+    w.classList.add("info");
+    w.hidden = false;
+  } else w.hidden = true;
+}
 
 function setMic(id, recording, label) {
   const b = $(id);
@@ -345,17 +472,7 @@ $("handsFree").onchange = () => store.set("handsFree", $("handsFree").checked);
 $("voice").onchange = () => store.set("voice:" + state.learn, $("voice").value);
 
 speechSynthesis.onvoiceschanged = () => tts.load();
-// Speech recognition only really works in Chrome, Edge and (with Siri on) Safari.
-const ua = navigator.userAgent;
-const badBrowser = !SR ? "Speech recognition isn't available in this browser."
-  : navigator.brave ? "Brave doesn't support speech recognition."
-  : /Electron|Claude\//.test(ua) ? "This in-app browser can't use the microphone."
-  : /OPR\/|Arc\//.test(ua) ? "This browser may not support speech recognition."
-  : "";
-if (badBrowser) {
-  $("supportWarning").textContent = `${badBrowser} Open this page in Google Chrome or Microsoft Edge to speak. You can still type your answers.`;
-  $("supportWarning").hidden = false;
-}
+showListenNote();
 for (const b of document.querySelectorAll(".mic")) b.append(Object.assign(el("span", "mic-level"), { ariaHidden: "true" }), );
 document.querySelectorAll(".mic-level").forEach((n) => n.append(el("i")));
 
@@ -599,7 +716,7 @@ function addMsg(who, text, { speakable = true, romanized = "", english = "" } = 
 }
 
 function setTalkEnabled(on) {
-  $("talkMic").disabled = !on || !SR;
+  $("talkMic").disabled = !on;
   $("typeInput").disabled = !on;
   $("typeSend").disabled = !on;
 }
@@ -713,7 +830,7 @@ async function practise(target, btn, out) {
 }
 
 function autoListen() {
-  if ($("handsFree").checked && SR && !state.busy && !$("talkView").hidden) $("talkMic").click();
+  if ($("handsFree").checked && !state.busy && !$("talkView").hidden) $("talkMic").click();
 }
 
 async function sendLearnerTurn(text, seconds) {
@@ -896,7 +1013,7 @@ function loadSample() {
   $("readResult").hidden = true;
   renderPassage();
   $("listenBtn").disabled = false;
-  $("readMic").disabled = !SR;
+  $("readMic").disabled = false;
 }
 
 function resetConversation() {
@@ -910,7 +1027,7 @@ function resetConversation() {
   $("talkTitle").textContent = "Talk about your topic";
   $("report").hidden = true;
   setTalkEnabled(false);
-  $("talkMic").disabled = !SR;
+  $("talkMic").disabled = false;
 }
 
 // Switch between learning English and Hindi.
@@ -932,4 +1049,4 @@ $("learn").onclick = (e) => { const b = e.target.closest("button"); if (b && b.d
 
 setLearn(state.learn, { initial: true });
 setTalkEnabled(false);
-$("talkMic").disabled = !SR;
+$("talkMic").disabled = false;

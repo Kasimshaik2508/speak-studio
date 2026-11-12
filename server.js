@@ -23,9 +23,9 @@ const coolingDown = (m) => (cooldown.get(m) || 0) > Date.now();
 const HOSTED = Boolean(process.env.RENDER || process.env.HOSTED);
 const LIMIT_PER_HOUR = Number(process.env.LIMIT_PER_HOUR || 60);
 const usage = new Map(); // ip -> timestamps of AI requests in the last hour
-function overLimit(req) {
+function overLimit(req, bucket = "coach") {
   if (!HOSTED) return false;
-  const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+  const ip = bucket + ":" + String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
   const now = Date.now();
   const recent = (usage.get(ip) || []).filter((t) => now - t < 3600_000);
   if (recent.length >= LIMIT_PER_HOUR) { usage.set(ip, recent); return true; }
@@ -34,11 +34,11 @@ function overLimit(req) {
   if (usage.size > 5000) for (const [k, v] of usage) if (!v.some((t) => now - t < 3600_000)) usage.delete(k);
   return false;
 }
-async function readBody(req) {
+async function readBody(req, max = 300_000) {
   let body = "";
   for await (const chunk of req) {
     body += chunk;
-    if (body.length > 300_000) throw new Error("That request was too large.");
+    if (body.length > max) throw new Error("That was too long to process. Try a shorter recording.");
   }
   return body;
 }
@@ -317,7 +317,7 @@ async function ask(schema, system, messages, deeper = false) {
     : "No Gemini API key yet. Paste your key in the box at the top of the page and press Save.");
   const contents = messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
+    parts: Array.isArray(m.content) ? m.content : [{ text: m.content }],
   }));
   const config = {
     systemInstruction: system,
@@ -334,7 +334,25 @@ async function ask(schema, system, messages, deeper = false) {
   }
 }
 
+const TranscriptSchema = z.object({
+  text: z.string().describe("Exactly the words spoken, or an empty string if there is no clear speech"),
+});
+
 const handlers = {
+  // Speech to text for browsers without working speech recognition (Brave, Firefox...).
+  async transcribe({ audio, mimeType, language }) {
+    const L = lang(language);
+    if (typeof audio !== "string" || !audio) throw new Error("No recording was received.");
+    if (!/^audio\/(wav|webm|ogg|mp4|mpeg|aac|flac)/.test(mimeType || "")) throw new Error("Unsupported recording format.");
+    const system = `You are a speech-to-text engine for a ${L.name} learner.
+Transcribe exactly what the speaker says, word for word.
+Keep every grammar mistake, wrong word, repetition and filler sound (um, uh, matlab). Never correct, translate, finish or tidy up what they said: their mistakes are what the coach needs to see.
+${language === "hi" ? "Write Hindi in Devanagari. English words said inside Hindi sentences may stay as they would normally be written in Hindi chat (Devanagari)." : "Write it in English."}
+If there is no clear speech, return an empty string.
+Reply only with JSON matching the requested schema.`;
+    return ask(TranscriptSchema, system, [{ role: "user", content: [{ inlineData: { mimeType, data: audio } }, { text: "Transcribe this recording." }] }]);
+  },
+
   async passage({ topic, level, language }) {
     const L = lang(language);
     return ask(
@@ -407,9 +425,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname.startsWith("/api/")) {
     const name = url.pathname.slice(5);
     if (!handlers[name]) return send(res, 404, { error: "Unknown endpoint" });
-    if (overLimit(req)) return send(res, 429, { error: "You've practised a lot this hour! Take a short break and try again in a little while." });
+    if (overLimit(req, name === "transcribe" ? "listen" : "coach")) return send(res, 429, { error: "You've practised a lot this hour! Take a short break and try again in a little while." });
     try {
-      const body = await readBody(req);
+      const body = await readBody(req, name === "transcribe" ? 8_000_000 : 300_000);
       const data = await handlers[name](JSON.parse(body || "{}"));
       send(res, 200, data);
     } catch (err) {
