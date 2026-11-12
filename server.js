@@ -16,6 +16,9 @@ let API_KEY = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "").t
 const makeClient = (apiKey) => new GoogleGenAI({ apiKey, httpOptions: { timeout: 20000, retryOptions: { attempts: 1 } } });
 let ai = makeClient(API_KEY || "missing");
 let CANDIDATES = []; // models this key can use, best first
+const GONE = new Set(); // models Google says this key can't use (404)
+const cooldown = new Map(); // model -> time until which we skip it because Google said it was overloaded
+const coolingDown = (m) => (cooldown.get(m) || 0) > Date.now();
 // On a public host (Render sets RENDER), visitors can't change the key and usage is limited per visitor.
 const HOSTED = Boolean(process.env.RENDER || process.env.HOSTED);
 const LIMIT_PER_HOUR = Number(process.env.LIMIT_PER_HOUR || 60);
@@ -95,7 +98,8 @@ async function pickWorkingModel(key, candidates) {
   const test = makeClient(key);
   let lastErr;
   let busyModel = null; // the key works but this model was overloaded: usable later
-  for (const model of candidates.slice(0, 8)) {
+  const ordered = candidates.filter((m) => !GONE.has(m)).sort((a, b) => coolingDown(a) - coolingDown(b));
+  for (const model of ordered.slice(0, 10)) {
     try {
       await test.models.generateContent({ model, contents: "Reply with OK." });
       return { model, client: test };
@@ -103,11 +107,13 @@ async function pickWorkingModel(key, candidates) {
       lastErr = err;
       if (err instanceof ApiError && (err.status === 404 || err.status === 403 && /model/i.test(err.message))) {
         console.log(`Model ${model} isn't available for this key, trying the next one`);
+        GONE.add(model);
         continue;
       }
       if (err instanceof ApiError && [429, 500, 503].includes(err.status)) {
         console.log(`Model ${model} is busy (${err.status}), trying the next one`);
         busyModel ??= model;
+        cooldown.set(model, Date.now() + 90_000);
         continue;
       }
       console.error("[key test]", err);
@@ -125,7 +131,8 @@ async function setKey(key) {
   if (!key) throw new Error("Paste your Gemini API key first.");
   const candidates = await checkKey(key);
   const { model, client: test } = await pickWorkingModel(key, candidates);
-  CANDIDATES = candidates;
+  CANDIDATES = candidates.filter((m) => !GONE.has(m));
+  console.log(`Models to use, best first: ${CANDIDATES.join(", ")}`);
   API_KEY = key;
   MODEL = model;
   ai = test;
@@ -260,10 +267,16 @@ function thinkingFor(model, deeper) {
 }
 
 // Try the current model, and if Google says it's overloaded, move on to the next one that answers.
+// Overloaded models are skipped for 90 seconds so the next reply doesn't wait on them again.
 async function generate(contents, baseConfig, deeper) {
-  const order = [MODEL, ...CANDIDATES.filter((m) => m !== MODEL)].slice(0, 5);
-  let lastErr;
+  const order = [MODEL, ...CANDIDATES.filter((m) => m !== MODEL)]
+    .filter((m) => !GONE.has(m))
+    .sort((a, b) => coolingDown(a) - coolingDown(b))
+    .slice(0, 8);
+  const started = Date.now();
+  let busyErr, lastErr;
   for (const model of order) {
+    if (Date.now() - started > 50_000) break; // don't keep the learner waiting forever
     const config = { ...baseConfig };
     const thinking = thinkingFor(model, deeper);
     if (thinking) config.thinkingConfig = thinking;
@@ -277,15 +290,23 @@ async function generate(contents, baseConfig, deeper) {
         delete config.thinkingConfig;
         response = await ai.models.generateContent({ model, contents, config });
       }
+      cooldown.delete(model);
       if (model !== MODEL) { console.log(`Switched to ${model} because ${MODEL} was busy`); MODEL = model; }
       return response;
     } catch (err) {
       lastErr = err;
-      const gone = err instanceof ApiError && err.status === 404;
-      if (!isBusy(err) && !gone) throw err;
-      console.log(`${model} ${gone ? "isn't available" : "is busy"} (${err.status || err.name}), trying the next model`);
+      if (err instanceof ApiError && err.status === 404) {
+        console.log(`${model} isn't available for this key; won't try it again`);
+        GONE.add(model);
+        continue;
+      }
+      if (!isBusy(err)) throw err;
+      busyErr = err;
+      cooldown.set(model, Date.now() + 90_000);
+      console.log(`${model} is busy (${err.status || err.name}), trying the next model`);
     }
   }
+  if (busyErr || !lastErr) throw new Error("Gemini is very busy right now. Wait a few seconds and try again.");
   throw lastErr;
 }
 
