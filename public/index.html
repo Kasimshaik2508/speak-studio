@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speak Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+Devanagari:wght@400;600&family=Noto+Serif+Devanagari:wght@400;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <form class="keybox" id="keyBox" hidden>
+    <div class="keybox-text">
+      <strong>Connect your Gemini API key</strong>
+      <span class="small muted">The coach needs it to write passages, correct you and talk back. Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. It's saved only on this computer.</span>
+    </div>
+    <div class="keybox-row">
+      <label class="sr-only" for="keyInput">Gemini API key</label>
+      <input id="keyInput" type="password" placeholder="Paste your Gemini API key here (starts with AIza…)" autocomplete="off" spellcheck="false">
+      <button class="primary" type="submit" id="keySave">Save key</button>
+      <button class="ghost" type="button" id="keyCancel" hidden>Cancel</button>
+    </div>
+    <span class="small" id="keyMsg" aria-live="polite"></span>
+  </form>
+  <aside class="panel" aria-label="Session settings">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <div>
+        <h1>Speak Studio</h1>
+        <p class="muted small">Read aloud. Talk it through. Get corrected out loud.</p>
+      </div>
+    </div>
+
+    <div class="field">
+      <span class="label" id="learnLabel">I'm learning</span>
+      <div class="segmented two" role="radiogroup" aria-labelledby="learnLabel" id="learn">
+        <button type="button" role="radio" data-value="en" aria-checked="true">English</button>
+        <button type="button" role="radio" data-value="hi" aria-checked="false" lang="hi">हिन्दी · Hindi</button>
+      </div>
+    </div>
+
+    <label class="field">
+      <span class="label">Topic</span>
+      <input id="topic" type="text" value="Travelling on a small budget" autocomplete="off">
+    </label>
+    <div class="chips" id="topicChips" aria-label="Topic ideas"></div>
+
+    <div class="field">
+      <span class="label" id="levelLabel">Level</span>
+      <div class="segmented" role="radiogroup" aria-labelledby="levelLabel" id="level">
+        <button type="button" role="radio" data-value="beginner" aria-checked="false">Beginner</button>
+        <button type="button" role="radio" data-value="intermediate" aria-checked="true">Intermediate</button>
+        <button type="button" role="radio" data-value="advanced" aria-checked="false">Advanced</button>
+      </div>
+    </div>
+
+    <details class="field voice-settings" open>
+      <summary class="label">Voice &amp; listening</summary>
+      <label class="field">
+        <span class="small muted">Coach voice</span>
+        <select id="voice"></select>
+        <span class="small muted" id="voiceTip" hidden></span>
+      </label>
+      <label class="field">
+        <span class="small muted">Speaking speed <output id="rateOut">0.95×</output></span>
+        <input id="rate" type="range" min="0.6" max="1.3" step="0.05" value="0.95">
+      </label>
+      <label class="field">
+        <span class="small muted">Your accent (for recognition)</span>
+        <select id="lang"></select>
+      </label>
+      <label class="toggle">
+        <input id="handsFree" type="checkbox" checked>
+        <span>Hands-free: stop when I pause, listen after the coach speaks</span>
+      </label>
+    </details>
+
+    <section class="stats" aria-label="Session stats">
+      <div class="stat"><span class="num" id="statTurns">0</span><span class="small muted">turns</span></div>
+      <div class="stat"><span class="num" id="statFixes">0</span><span class="small muted">corrections</span></div>
+      <div class="stat"><span class="num" id="statWpm">–</span><span class="small muted">words/min</span></div>
+      <div class="stat"><span class="num" id="statFillers">0</span><span class="small muted">fillers</span></div>
+    </section>
+
+    <p class="small muted key-status">AI: <span id="keyState">checking…</span> · <button type="button" class="linkish" id="changeKey">Change API key</button></p>
+
+    <section class="vocab" aria-label="Word bank">
+      <h2 class="label">Word bank <span class="muted" id="vocabCount"></span></h2>
+      <ul id="vocabList" class="vocab-list"></ul>
+      <p class="small muted" id="vocabEmpty">New words from passages and conversations collect here. Tap one to hear it.</p>
+    </section>
+  </aside>
+
+  <main class="stage">
+    <div class="support-warning" id="supportWarning" hidden>
+      Speech recognition isn't available in this browser. Open this page in Chrome, Edge or Safari to speak. You can still type your answers.
+    </div>
+
+
+    <nav class="tabs" role="tablist">
+      <button role="tab" id="tabRead" aria-selected="true" aria-controls="readView">1 · Read aloud</button>
+      <button role="tab" id="tabTalk" aria-selected="false" aria-controls="talkView">2 · Conversation</button>
+      <button class="ghost end-btn" id="endBtn" type="button">End session &amp; get report</button>
+    </nav>
+
+    <!-- READING -->
+    <section id="readView" role="tabpanel" aria-labelledby="tabRead" class="view">
+      <div class="view-head">
+        <div>
+          <p class="eyebrow" id="passageMeta">Reading passage</p>
+          <h2 id="passageTitle">Get a passage on your topic</h2>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="newPassageBtn" type="button">New passage</button>
+          <button class="ghost" id="listenBtn" type="button" disabled>Hear it first</button>
+        </div>
+      </div>
+
+      <article class="passage" id="passage" aria-live="polite">
+        <p class="muted">Pick a topic and level, then press <strong>New passage</strong>. Read it out loud while the coach listens. Afterwards you'll see which words were unclear and hear how to fix them.</p>
+      </article>
+      <details class="passage-help" id="passageHelp" hidden>
+        <summary>Show in Roman letters and English</summary>
+        <p class="roman" id="passageRoman"></p>
+        <p class="muted" id="passageEnglish"></p>
+      </details>
+
+      <div class="record-row">
+        <button class="mic" id="readMic" type="button" disabled aria-pressed="false">
+          <span class="mic-dot" aria-hidden="true"></span><span class="mic-label">Start reading</span>
+        </button>
+        <div class="live small muted" id="readLive" aria-live="polite"></div>
+      </div>
+
+      <div class="result" id="readResult" hidden>
+        <div class="score-wrap">
+          <div class="score" id="readScore">–</div>
+          <div class="small muted">score</div>
+        </div>
+        <div class="result-body">
+          <p id="readFeedback"></p>
+          <div class="facts small" id="readFacts"></div>
+          <ul class="problem-words" id="problemWords"></ul>
+          <div class="actions">
+            <button class="ghost" id="retryReadBtn" type="button">Read it again</button>
+            <button class="primary" id="discussBtn" type="button">Discuss this passage →</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONVERSATION -->
+    <section id="talkView" role="tabpanel" aria-labelledby="tabTalk" class="view" hidden>
+      <div class="view-head">
+        <div>
+          <p class="eyebrow">Conversation with <span class="coachName">Maya</span>, your coach</p>
+          <h2 id="talkTitle">Talk about your topic</h2>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="startTalkBtn" type="button">Start conversation</button>
+        </div>
+      </div>
+
+      <div class="chat" id="chat" aria-live="polite">
+        <div class="empty muted" id="chatEmpty">
+          <span class="coachName">Maya</span> asks you a question out loud. Answer by speaking. If you make a mistake she tells you the better way to say it, then keeps the conversation going. Use <strong>Repeat it</strong> on any correction to practise the fixed sentence.
+        </div>
+      </div>
+
+      <div class="composer">
+        <button class="mic big" id="talkMic" type="button" disabled aria-pressed="false">
+          <span class="mic-dot" aria-hidden="true"></span><span class="mic-label">Tap to speak</span>
+        </button>
+        <form id="typeForm" class="type-form">
+          <label class="sr-only" for="typeInput">Or type your answer</label>
+          <input id="typeInput" type="text" placeholder="…or type your answer" autocomplete="off" disabled>
+          <button class="ghost" type="submit" id="typeSend" disabled>Send</button>
+        </form>
+      </div>
+      <div class="live small muted" id="talkLive" aria-live="polite"></div>
+    </section>
+
+    <!-- REPORT -->
+    <section class="report" id="report" hidden aria-labelledby="reportTitle">
+      <div class="view-head">
+        <div>
+          <p class="eyebrow">Session report</p>
+          <h2 id="reportTitle">How you did</h2>
+        </div>
+        <button class="ghost" id="closeReport" type="button">Close</button>
+      </div>
+      <p id="reportOverall"></p>
+      <div class="report-grid">
+        <div><h3 class="label">Strengths</h3><ul id="reportStrengths"></ul></div>
+        <div><h3 class="label">Work on</h3><ul id="reportFocus"></ul></div>
+      </div>
+      <h3 class="label">Practice sentences: read these aloud</h3>
+      <ol id="reportPractice" class="practice"></ol>
+    </section>
+
+    <div class="status" id="status" role="status" aria-live="polite" hidden></div>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

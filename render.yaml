@@ -1,0 +1,15 @@
+# Render blueprint: a free web service for Speak Studio.
+services:
+  - type: web
+    name: speak-studio
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: GEMINI_API_KEY
+        sync: false   # Render asks you to paste it when you create the service
+      - key: LIMIT_PER_HOUR
+        value: "60"
