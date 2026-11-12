@@ -47,6 +47,8 @@ function explainGoogleError(status, reason, message) {
     return `This key is restricted so it can't call the Gemini API. Create an unrestricted key at aistudio.google.com/apikey.${g}`;
   if (status === 400 && /location|region|not supported/i.test(message))
     return `The Gemini API isn't available in your country or region for this key.${g}`;
+  if (status === 503 || status === 500)
+    return `Gemini is very busy right now. Wait a few seconds and try again.`;
   if (status === 429)
     return `This key has used up its free quota for now. Wait a minute and try again, or check your limits in Google AI Studio.${g}`;
   return `Gemini returned error ${status}.${g}`;
@@ -87,6 +89,7 @@ async function checkKey(key) {
 async function pickWorkingModel(key, candidates) {
   const test = new GoogleGenAI({ apiKey: key });
   let lastErr;
+  let busyModel = null; // the key works but this model was overloaded: usable later
   for (const model of candidates.slice(0, 8)) {
     try {
       await test.models.generateContent({ model, contents: "Reply with OK." });
@@ -97,11 +100,17 @@ async function pickWorkingModel(key, candidates) {
         console.log(`Model ${model} isn't available for this key, trying the next one`);
         continue;
       }
+      if (err instanceof ApiError && [429, 500, 503].includes(err.status)) {
+        console.log(`Model ${model} is busy (${err.status}), trying the next one`);
+        busyModel ??= model;
+        continue;
+      }
       console.error("[key test]", err);
       if (err instanceof ApiError) throw new Error(explainGoogleError(err.status, "", err.message));
       throw new Error(`Couldn't test the key: ${err.message}`);
     }
   }
+  if (busyModel) { console.log(`All models busy; using ${busyModel} anyway`); return { model: busyModel, client: test }; }
   throw new Error(`None of the Gemini models tried worked with this key. Last error: ${lastErr?.message || "unknown"}`);
 }
 
@@ -223,7 +232,29 @@ function toGeminiSchema(schema) {
 }
 
 // messages: [{role:"user"|"assistant", content:string}]
+// If choosing a model failed at startup (e.g. Google was busy), try again when someone needs it.
+let settingUp = null;
+async function ensureModel() {
+  if (MODEL || !API_KEY) return;
+  settingUp ??= setKey(API_KEY).finally(() => { settingUp = null; });
+  await settingUp;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function generate(params) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err) {
+      // Google's "high demand" errors are usually gone within seconds.
+      if (attempt < 2 && err instanceof ApiError && [500, 503].includes(err.status)) { await sleep(1500 * (attempt + 1)); continue; }
+      throw err;
+    }
+  }
+}
+
 async function ask(schema, system, messages, deeper = false) {
+  await ensureModel();
   if (!API_KEY || !MODEL) throw new Error(HOSTED
     ? "The coach isn't connected to Gemini yet. Ask the person who shared this link to set the GEMINI_API_KEY."
     : "No Gemini API key yet. Paste your key in the box at the top of the page and press Save.");
@@ -245,12 +276,12 @@ async function ask(schema, system, messages, deeper = false) {
 
   let response;
   try {
-    response = await ai.models.generateContent({ model: MODEL, contents, config });
+    response = await generate({ model: MODEL, contents, config });
   } catch (err) {
     // If this model doesn't accept the thinking setting, retry once without it.
     if (!(err instanceof ApiError) || err.status !== 400 || !config.thinkingConfig || !/think/i.test(err.message)) throw err;
     delete config.thinkingConfig;
-    response = await ai.models.generateContent({ model: MODEL, contents, config });
+    response = await generate({ model: MODEL, contents, config });
   }
   const text = response.text;
   if (!text) throw new Error("The coach could not answer that. Try rephrasing.");
@@ -318,7 +349,10 @@ function send(res, status, body, type = "application/json") {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  if (req.method === "GET" && url.pathname === "/api/status") return send(res, 200, { hasKey: Boolean(API_KEY && MODEL), model: MODEL, locked: HOSTED });
+  if (req.method === "GET" && url.pathname === "/api/status") {
+    if (API_KEY && !MODEL) ensureModel().catch((e) => console.error("Model setup:", e.message));
+    return send(res, 200, { hasKey: Boolean(API_KEY && MODEL), model: MODEL, locked: HOSTED });
+  }
   if (req.method === "POST" && url.pathname === "/api/key") {
     if (HOSTED) return send(res, 403, { error: "The key can't be changed on the shared site." });
     try {
