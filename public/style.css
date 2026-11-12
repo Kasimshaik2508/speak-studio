@@ -92,8 +92,11 @@ output { font-family: var(--font-mono); color: var(--ink); }
 .keybox a { color: var(--accent); font-weight: 600; }
 .keybox-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .keybox-row input { flex: 1; min-width: 220px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-family: var(--font-mono); font-size: 14px; }
-#keyMsg.err { color: var(--bad); }
-#keyMsg.okmsg { color: var(--ok); }
+#keyMsg.err, #micTestResult.err { color: var(--bad); }
+#keyMsg.okmsg, #micTestResult.okmsg { color: var(--ok); }
+.mic-level { display: none; width: 44px; height: 6px; border-radius: 3px; background: rgba(255,255,255,.3); overflow: hidden; }
+.mic-level i { display: block; height: 100%; width: 0; background: currentColor; transition: width .08s; }
+.mic[aria-pressed=true] .mic-level { display: inline-block; }
 .key-status { margin: 0; }
 .linkish { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font-weight: 600; font-size: inherit; }
 .tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line); }

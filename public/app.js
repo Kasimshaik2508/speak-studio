@@ -169,26 +169,88 @@ function setCoachSpeaking(on) {
 // ================= speech in (recognition) =================
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
+// Live microphone level, so the learner can see whether any sound reaches the browser.
+const micMeter = {
+  stream: null, ctx: null, raf: 0, peak: 0,
+  async start() {
+    this.peak = 0;
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      if (err.name === "NotAllowedError") throw new Error(MIC_BLOCKED);
+      if (err.name === "NotFoundError") throw new Error("No microphone was found. Plug one in or pick one in your computer's sound settings, then try again.");
+      return; // the meter is only a helper; recognition may still work
+    }
+    this.ctx = new AudioContext();
+    const an = this.ctx.createAnalyser();
+    an.fftSize = 1024;
+    this.ctx.createMediaStreamSource(this.stream).connect(an);
+    const buf = new Uint8Array(an.fftSize);
+    const tick = () => {
+      an.getByteTimeDomainData(buf);
+      let m = 0;
+      for (const v of buf) m = Math.max(m, Math.abs(v - 128));
+      const lvl = m / 128;
+      this.peak = Math.max(this.peak, lvl);
+      document.querySelectorAll(".mic-level i").forEach((i) => (i.style.width = Math.min(100, lvl * 250) + "%"));
+      this.raf = requestAnimationFrame(tick);
+    };
+    tick();
+  },
+  stop() {
+    cancelAnimationFrame(this.raf);
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.ctx?.close().catch(() => {});
+    this.stream = this.ctx = null;
+    document.querySelectorAll(".mic-level i").forEach((i) => (i.style.width = "0"));
+  },
+};
+
+const MIC_BLOCKED = "Microphone access is blocked. Click the microphone or lock icon in the address bar, allow the microphone, and reload. On a Mac, also check System Settings › Privacy & Security › Microphone and switch on your browser.";
+
+// Explain why no words are arriving, using what the level meter saw.
+function whyNoWords(lastError) {
+  if (lastError === "network") return SPEECH_NETWORK;
+  if (micMeter.stream && micMeter.peak < 0.02)
+    return "Your microphone isn't picking up any sound. Check it isn't muted, and that the right microphone is chosen: click the microphone icon in Chrome's address bar, or your computer's sound settings.";
+  return "Sound is reaching the microphone but no words are being recognised. Speak a little louder and closer, and check the accent setting matches the language you're speaking.";
+}
+const SPEECH_NETWORK = "Speech recognition couldn't connect to its service. It works in Google Chrome or Microsoft Edge with an internet connection; Brave, Arc, Opera, Firefox and in-app browsers don't support it.";
+
 const listener = {
   active: false,
   rec: null,
   // Resolves with { text, seconds } when listening stops.
-  start({ onUpdate, autoStopMs = 0 } = {}) {
-    if (!SR) return Promise.reject(new Error("Speech recognition isn't supported in this browser."));
+  async start({ onUpdate, onHint, autoStopMs = 0, maxMs = 0 } = {}) {
+    if (!SR) throw new Error("Speech recognition isn't supported in this browser. Open this page in Google Chrome or Microsoft Edge.");
     tts.stop();
     this.active = true;
+    await micMeter.start().catch((err) => { this.active = false; throw err; });
+    if (!this.active) { micMeter.stop(); return { text: "", seconds: 0 }; }
     let committed = "";
     let current = "";
-    let silence;
+    let silence, hintTimer, maxTimer;
     let startedAt = 0;
     let lastSpeech = 0;
+    let lastError = "";
+    let quickEnds = 0;
+    let launchedAt = 0;
     return new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(silence); clearTimeout(hintTimer); clearTimeout(maxTimer); micMeter.stop(); };
       const finish = () => {
-        clearTimeout(silence);
+        cleanup();
         const text = (committed + " " + current).replace(/\s+/g, " ").trim();
         const end = lastSpeech || Date.now();
         resolve({ text, seconds: startedAt ? Math.max(1, (end - startedAt) / 1000) : 0 });
       };
+      const fail = (msg) => {
+        this.active = false;
+        cleanup();
+        try { this.rec?.abort(); } catch {}
+        reject(new Error(msg));
+      };
+      hintTimer = setTimeout(() => { if (!startedAt && this.active) onHint?.(whyNoWords(lastError)); }, 6000);
+      if (maxMs) maxTimer = setTimeout(() => this.stop(), maxMs);
       const launch = () => {
         const rec = new SR();
         rec.lang = $("lang").value;
@@ -200,26 +262,35 @@ const listener = {
           current = finals + interim;
           if (!startedAt) startedAt = Date.now();
           lastSpeech = Date.now();
+          quickEnds = 0;
           onUpdate?.((committed + " " + current).trim());
           if (autoStopMs) { clearTimeout(silence); silence = setTimeout(() => this.stop(), autoStopMs); }
         };
         rec.onerror = (e) => {
-          if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-            this.active = false;
-            reject(new Error("Microphone access was blocked. Allow the microphone for this page in your browser's site settings."));
-          } else if (e.error === "audio-capture") {
-            this.active = false;
-            reject(new Error("No microphone was found. Plug one in and try again."));
-          }
+          lastError = e.error;
+          console.warn("speech recognition error:", e.error, e.message || "");
+          if (e.error === "not-allowed" || e.error === "service-not-allowed")
+            fail(/safari/i.test(navigator.userAgent) && !/chrome/i.test(navigator.userAgent)
+              ? "Safari blocked speech recognition. Turn on Siri in System Settings, or use Google Chrome."
+              : MIC_BLOCKED);
+          else if (e.error === "audio-capture") fail("No microphone was found. Plug one in and try again.");
+          else if (e.error === "network") fail(SPEECH_NETWORK);
+          else if (e.error === "language-not-supported") fail(`This browser can't recognise ${$("lang").selectedOptions[0]?.textContent || "this language"}. Use Google Chrome.`);
           // "no-speech" and "aborted" are normal; onend handles them.
         };
         rec.onend = () => {
-          // Browsers end recognition after a pause; keep going until the user stops.
-          if (this.active) { committed += " " + current; current = ""; try { rec.start(); } catch { launch(); } }
-          else finish();
+          if (!this.active) return finish();
+          // Browsers end recognition after a pause; keep going until the user stops,
+          // but don't spin forever if it keeps ending straight away.
+          quickEnds = Date.now() - launchedAt < 1500 ? quickEnds + 1 : 0;
+          if (quickEnds >= 4) return fail(`Speech recognition keeps stopping${lastError ? ` (${lastError})` : ""}. ${whyNoWords(lastError)}`);
+          committed += " " + current;
+          current = "";
+          launch();
         };
         this.rec = rec;
-        rec.start();
+        launchedAt = Date.now();
+        try { rec.start(); } catch (err) { fail("Couldn't start listening: " + err.message); }
       };
       launch();
     });
@@ -274,7 +345,37 @@ $("handsFree").onchange = () => store.set("handsFree", $("handsFree").checked);
 $("voice").onchange = () => store.set("voice:" + state.learn, $("voice").value);
 
 speechSynthesis.onvoiceschanged = () => tts.load();
-if (!SR) { $("supportWarning").hidden = false; }
+// Speech recognition only really works in Chrome, Edge and (with Siri on) Safari.
+const ua = navigator.userAgent;
+const badBrowser = !SR ? "Speech recognition isn't available in this browser."
+  : navigator.brave ? "Brave doesn't support speech recognition."
+  : /Electron|Claude\//.test(ua) ? "This in-app browser can't use the microphone."
+  : /OPR\/|Arc\//.test(ua) ? "This browser may not support speech recognition."
+  : "";
+if (badBrowser) {
+  $("supportWarning").textContent = `${badBrowser} Open this page in Google Chrome or Microsoft Edge to speak. You can still type your answers.`;
+  $("supportWarning").hidden = false;
+}
+for (const b of document.querySelectorAll(".mic")) b.append(Object.assign(el("span", "mic-level"), { ariaHidden: "true" }), );
+document.querySelectorAll(".mic-level").forEach((n) => n.append(el("i")));
+
+$("micTest").onclick = async () => {
+  if (listener.active) return listener.stop();
+  const out = $("micTestResult");
+  $("micTest").textContent = "Listening… say something";
+  out.className = "small";
+  out.textContent = "";
+  try {
+    const { text } = await listener.start({ autoStopMs: 2000, maxMs: 9000, onUpdate: (t) => (out.textContent = "Heard: " + t), onHint: (h) => (out.textContent = h) });
+    if (text) { out.className = "small okmsg"; out.textContent = `✓ It works. Heard: “${text}”`; }
+    else { out.className = "small err"; out.textContent = whyNoWords(""); }
+  } catch (err) {
+    out.className = "small err";
+    out.textContent = err.message;
+  } finally {
+    $("micTest").textContent = "Test microphone";
+  }
+};
 
 const topic = () => $("topic").value.trim() || "Everyday life";
 
@@ -398,6 +499,7 @@ $("readMic").onclick = async () => {
   try {
     const { text, seconds } = await listener.start({
       autoStopMs: $("handsFree").checked ? 3500 : 0,
+      onHint: (h) => ($("readLive").textContent = h),
       onUpdate: (t) => {
         // Follow along: move a cursor forward through the passage as words match.
         const heard = words(t);
@@ -636,6 +738,7 @@ $("talkMic").onclick = async () => {
     const { text, seconds } = await listener.start({
       autoStopMs: $("handsFree").checked ? 1800 : 0,
       onUpdate: (t) => ($("talkLive").textContent = t),
+      onHint: (h) => ($("talkLive").textContent = h),
     });
     setMic("talkMic", false, "Tap to speak");
     $("talkLive").textContent = "";
